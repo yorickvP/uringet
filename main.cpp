@@ -108,16 +108,6 @@ public:
   }
 };
 
-// {
-//     "dest": "openai/clip-vit-large-patch14-336",
-//     "src": "clip-vit-large-patch14-336/ce19dc912ca5cd21c8a653c79e251e808ccabcd1",
-//     "files": [
-//         "config.json",
-//         "preprocessor_config.json",
-//         "pytorch_model.bin"
-//     ],
-// }
-
 class FileSpec {
 public:
   std::string dest;
@@ -171,13 +161,15 @@ uio::task<> download_chunk(uio::io_service& service, HTTPConnection& conn, Chunk
   fmt::print(stderr, "download_chunk speed: {} MB/s\n", (chunk.length / 1024.0 / 1024.0 * 8.0) / (duration / 1000.0));
 }
 
-uio::task<> download_filespec(uio::io_service& service, HTTPConnection& conn, FileSpec& filespec) {
+uio::task<> download_filespec(uio::io_service& service, std::vector<std::unique_ptr<HTTPConnection>>& conn, FileSpec& filespec) {
   // fmt::print(stderr, "download_filespec start: {}\n", filespec.dest);
   std::queue<Chunk> chunks;
   std::filesystem::create_directories(filespec.dest);
+  uint64_t total_length = 0;
   for (auto& file_ : filespec.files) {
     auto url = fmt::format("/replicate-weights/{}/{}", filespec.src, file_);
-    uint64_t length = co_await get_content_length(service, conn, url.c_str());
+    uint64_t length = co_await get_content_length(service, *conn[0], url.c_str());
+    total_length += length;
     // todo create base dir
     auto file = co_await File::create(service, filespec.dest + "/" + file_, length);
     // enqueue chunks
@@ -188,11 +180,24 @@ uio::task<> download_filespec(uio::io_service& service, HTTPConnection& conn, Fi
     } while (offset < length);
   }
   fmt::print(stderr, "download_filespec: {} chunks\n", chunks.size());
-  while (!chunks.empty()) {
-    auto& chunk = chunks.front();
-    co_await download_chunk(service, conn, chunk);
-    chunks.pop();
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  std::vector<uio::task<>> tasks;
+  auto fn = [&](auto& conn_) -> uio::task<> {
+    while (!chunks.empty()) {
+      auto chunk = chunks.front();
+      chunks.pop();
+      co_await download_chunk(service, *conn_, chunk);
+    }
+  };
+  for (auto& conn_ : conn) {
+    tasks.emplace_back(fn(conn_));
   }
+  for (auto& task : tasks) {
+    co_await task;
+  }
+  std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+  fmt::print(stderr, "download_filespec speed: {} MB/s\n", (total_length / 1024.0 / 1024.0 * 8.0) / (duration / 1000.0));
 }
 
 uio::task<> start_work(uio::io_service& service, const char* hostname, const char* path) {
@@ -216,14 +221,19 @@ uio::task<> start_work(uio::io_service& service, const char* hostname, const cha
         uio::on_scope_exit closesock([&]() { service.close(clientfd); });
 
         if (co_await service.connect(clientfd, addr->ai_addr, addr->ai_addrlen) < 0) continue;
-        HTTPConnection connection(clientfd, hostname);
-        co_await download_filespec(service, connection, filespecs[0]);
+        std::vector<std::unique_ptr<HTTPConnection>> connections;
+        connections.emplace_back(std::make_unique<HTTPConnection>(clientfd, hostname));
+        for (int i = 0; i < 4; i++) {
+          int clientfd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol) | uio::panic_on_err("socket creation", true);
+          //uio::on_scope_exit closesock([&]() { service.close(clientfd); });
+          if (co_await service.connect(clientfd, addr->ai_addr, addr->ai_addrlen) < 0) throw std::runtime_error("Unable to connect any resolved server");
+          connections.emplace_back(std::make_unique<HTTPConnection>(clientfd, hostname));
+        }
+        fmt::print(stdout, "opened {} connections\n", connections.size());
 
-        // auto header = fmt::format("GET {} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n", path, hostname);
-        // co_await service.send(clientfd, header.data(), header.size(), MSG_NOSIGNAL) | uio::panic_on_err("send", false);
+        co_await download_filespec(service, connections, filespecs[0]);
 
         // int res;
-
         // do {
         //   res = co_await service.splice(clientfd, -1, pipefd[1], -1, 8 * 1024, SPLICE_F_MOVE) | uio::panic_on_err("splice1", false);
         //   if (res <= 0) break;
