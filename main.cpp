@@ -116,14 +116,6 @@ public:
   FileSpec(std::string dest, std::string src, std::vector<std::string> files): dest(dest), src(src), files(files) {};
 };
 
-std::vector<FileSpec> filespecs = {
-  FileSpec("openai/clip-vit-large-patch14-336", "clip-vit-large-patch14-336/ce19dc912ca5cd21c8a653c79e251e808ccabcd1", {
-    "config.json",
-    "preprocessor_config.json",
-    "pytorch_model.bin"
-  }),
-};
-
 class Chunk {
 public:
   std::shared_ptr<File> file;
@@ -161,7 +153,7 @@ uio::task<> download_chunk(uio::io_service& service, HTTPConnection& conn, Chunk
   fmt::print(stderr, "download_chunk speed: {} MB/s\n", (chunk.length / 1024.0 / 1024.0 * 8.0) / (duration / 1000.0));
 }
 
-uio::task<> download_filespec(uio::io_service& service, std::vector<std::unique_ptr<HTTPConnection>>& conn, FileSpec& filespec) {
+uio::task<> download_filespec(uio::io_service& service, std::vector<std::unique_ptr<HTTPConnection>>& conn, const FileSpec& filespec) {
   // fmt::print(stderr, "download_filespec start: {}\n", filespec.dest);
   std::queue<Chunk> chunks;
   std::filesystem::create_directories(filespec.dest);
@@ -200,7 +192,8 @@ uio::task<> download_filespec(uio::io_service& service, std::vector<std::unique_
   fmt::print(stderr, "download_filespec speed: {} MB/s\n", (total_length / 1024.0 / 1024.0 * 8.0) / (duration / 1000.0));
 }
 
-uio::task<> start_work(uio::io_service& service, const char* hostname, const char* path) {
+
+uio::task<> start_work(uio::io_service& service, const char* hostname, const std::vector<FileSpec>& filespecs) {
  
     addrinfo hints = {
         .ai_family = AF_UNSPEC,
@@ -211,7 +204,7 @@ uio::task<> start_work(uio::io_service& service, const char* hostname, const cha
         throw std::runtime_error("getaddrinfo");
     }
     uio::on_scope_exit freeaddr([=]() { freeaddrinfo(addrs); });
-    int    pipefd[2];
+    int pipefd[2];
     pipe(pipefd) | uio::panic_on_err("pipe2", true);
     uio::on_scope_exit closepipe([=]() { close(pipefd[0]); close(pipefd[1]); });
  
@@ -222,23 +215,16 @@ uio::task<> start_work(uio::io_service& service, const char* hostname, const cha
 
         if (co_await service.connect(clientfd, addr->ai_addr, addr->ai_addrlen) < 0) continue;
         std::vector<std::unique_ptr<HTTPConnection>> connections;
+        uio::on_scope_exit slocesocks([&]() { for (auto& conn : connections) { service.close(conn->fd); } });
         connections.emplace_back(std::make_unique<HTTPConnection>(clientfd, hostname));
         for (int i = 0; i < 4; i++) {
           int clientfd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol) | uio::panic_on_err("socket creation", true);
-          //uio::on_scope_exit closesock([&]() { service.close(clientfd); });
           if (co_await service.connect(clientfd, addr->ai_addr, addr->ai_addrlen) < 0) throw std::runtime_error("Unable to connect any resolved server");
           connections.emplace_back(std::make_unique<HTTPConnection>(clientfd, hostname));
         }
         fmt::print(stdout, "opened {} connections\n", connections.size());
 
         co_await download_filespec(service, connections, filespecs[0]);
-
-        // int res;
-        // do {
-        //   res = co_await service.splice(clientfd, -1, pipefd[1], -1, 8 * 1024, SPLICE_F_MOVE) | uio::panic_on_err("splice1", false);
-        //   if (res <= 0) break;
-        //   co_await service.splice(pipefd[0], -1, STDOUT_FILENO, -1, 8 * 1024, SPLICE_F_MOVE) | uio::panic_on_err("splice2", false);
-        // } while (res > 0);
         co_return;
     }
     fmt::print(stdout, "ended!\n");
@@ -246,14 +232,22 @@ uio::task<> start_work(uio::io_service& service, const char* hostname, const cha
     throw std::runtime_error("Unable to connect any resolved server");
 }
 
+
+std::vector<FileSpec> filespecs = {
+  FileSpec("openai/clip-vit-large-patch14-336", "clip-vit-large-patch14-336/ce19dc912ca5cd21c8a653c79e251e808ccabcd1", {
+    "config.json",
+    "preprocessor_config.json",
+    "pytorch_model.bin"
+  }),
+};
+
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        fmt::print("Usage: {} <hostname> <path>\n", argv[0]);
+    if (argc != 1) {
+        fmt::print("Usage: {}\n", argv[0]);
         return 1;
     }
 
     uio::io_service service;
 
-    // Start main coroutine ( for co_await )
-    service.run(start_work(service, argv[1], argv[2]));
+    service.run(start_work(service, "storage.googleapis.com", filespecs));
 }
