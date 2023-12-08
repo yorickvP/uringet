@@ -1,5 +1,5 @@
 CXXFLAGS = -I include -std=c++20 -O1
-LDFLAGS = -luring -lfmt
+LDLIBS = -lexecinfo -lfmt -luring
 LINK.o = $(LINK.cc)
 
 main: main.o
